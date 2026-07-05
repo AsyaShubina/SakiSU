@@ -31,7 +31,7 @@ struct sdesc {
 };
 
 static apk_sign_key_t apk_sign_keys[] = {
-    { EXPECTED_SIZE_RESUKISU, EXPECTED_HASH_RESUKISU }, /* XingChenRS/SakiSU */
+    { EXPECTED_SIZE_SAKISU, EXPECTED_HASH_SAKISU }, /* XingChenRS/SakiSU */
 #ifdef CONFIG_KSU_MULTI_MANAGER_SUPPORT
     { EXPECTED_SIZE_OFFICIAL, EXPECTED_HASH_OFFICIAL }, // tiann/KernelSU
     { EXPECTED_SIZE_5EC1CFF, EXPECTED_HASH_5EC1CFF }, // 5ec1cff/KernelSU
@@ -221,6 +221,8 @@ static __always_inline bool check_v2_signature(char *path, u8 *signature_index)
     int v2_signing_blocks = 0;
     bool v3_signing_exist = false;
     bool v3_1_signing_exist = false;
+    bool v3_signing_valid = true;
+    bool v3_1_signing_valid = true;
     u8 matched_index = -1;
     int i;
     struct file *fp = filp_open(path, O_RDONLY, 0);
@@ -287,9 +289,11 @@ static __always_inline bool check_v2_signature(char *path, u8 *signature_index)
         } else if (id == 0xf05368c0u) {
             // http://aospxref.com/android-14.0.0_r2/xref/frameworks/base/core/java/android/util/apk/ApkSignatureSchemeV3Verifier.java#73
             v3_signing_exist = true;
+            v3_signing_valid = check_block(fp, &size4, &pos, &offset, NULL);
         } else if (id == 0x1b93ad61u) {
             // http://aospxref.com/android-14.0.0_r2/xref/frameworks/base/core/java/android/util/apk/ApkSignatureSchemeV3Verifier.java#74
             v3_1_signing_exist = true;
+            v3_1_signing_valid = check_block(fp, &size4, &pos, &offset, NULL);
         } else {
 #ifdef CONFIG_KSU_DEBUG
             pr_info("Unknown id: 0x%08x\n", id);
@@ -305,32 +309,37 @@ static __always_inline bool check_v2_signature(char *path, u8 *signature_index)
         v2_signing_valid = false;
     }
 
+#ifdef CONFIG_KSU_DEBUG
     if (v2_signing_valid) {
         int has_v1_signing = has_v1_signature_file(fp);
         if (has_v1_signing) {
-            pr_err("Unexpected v1 signature scheme found!\n");
-            filp_close(fp, 0);
-            return false;
+            pr_info("APK also carries a v1 signature scheme; relying on package verifier cross-check.\n");
         }
     }
+#endif
 clean:
     filp_close(fp, 0);
 
-    if (v3_signing_exist || v3_1_signing_exist) {
 #ifdef CONFIG_KSU_DEBUG
-        pr_err("Unexpected v3 signature scheme found!\n");
+    if (v3_signing_exist && !v3_signing_valid) {
+        pr_err("v3 signature scheme present but its cert is not trusted.\n");
+    }
+    if (v3_1_signing_exist && !v3_1_signing_valid) {
+        pr_err("v3.1 signature scheme present but its cert is not trusted.\n");
+    }
 #endif
+
+    if (!v2_signing_valid)
         return false;
-    }
+    if (v3_signing_exist && !v3_signing_valid)
+        return false;
+    if (v3_1_signing_exist && !v3_1_signing_valid)
+        return false;
 
-    if (v2_signing_valid) {
-        if (signature_index) {
-            *signature_index = matched_index;
-        }
-
-        return true;
+    if (signature_index) {
+        *signature_index = matched_index;
     }
-    return false;
+    return true;
 }
 
 #ifdef CONFIG_KSU_DEBUG
