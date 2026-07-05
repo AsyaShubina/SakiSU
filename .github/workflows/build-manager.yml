@@ -1,19 +1,18 @@
 name: Build Manager
 
 on:
-  workflow_dispatch:
   push:
-    branches: [ "main", "dev", "ci", "sync-upstream" ]
+    branches: [ "main", "dev", "ci", "sync-upstream", "sync/**" ]
     paths:
       - '.github/workflows/build-manager.yml'
       - '.github/workflows/build-lkm.yml'
+      - '.github/workflows/build-lkm-vivo.yml'
       - '.github/workflows/ddk-lkm.yml'
       - '.github/workflows/ksud.yml'
       - 'manager/**'
       - 'kernel/**'
       - 'userspace/**'
       - 'scripts/ksubot.py'
-  pull_request:
   workflow_call:
 
 jobs:
@@ -24,50 +23,90 @@ jobs:
       expected_hash: ${{ steps.extract.outputs.expected_hash }}
       keystore: ${{ steps.gen.outputs.keystore }}
       keystore_password: ${{ steps.gen.outputs.keystore_password }}
+      key_alias: ${{ steps.gen.outputs.key_alias }}
       key_password: ${{ steps.gen.outputs.key_password }}
     steps:
-      - name: Generate temporary keystore
-        if: github.event_name == 'pull_request'
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Materialize keystore
         id: gen
+        env:
+          PROD_KEYSTORE: ${{ secrets.KEYSTORE }}
+          PROD_STORE_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          PROD_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          PROD_KEY_PASS: ${{ secrets.KEY_PASSWORD }}
         run: |
-          KEYSTORE_PASSWORD=$(openssl rand -hex 32)
-          KEY_PASSWORD=$(openssl rand -hex 32)
-          echo "keystore_password=$KEYSTORE_PASSWORD" >> $GITHUB_OUTPUT
-          echo "key_password=$KEY_PASSWORD" >> $GITHUB_OUTPUT
+          if [ -n "$PROD_KEYSTORE" ] && [ -n "$PROD_STORE_PASS" ] && [ -n "$PROD_KEY_ALIAS" ] && [ -n "$PROD_KEY_PASS" ]; then
+            echo "::notice::Using long-lived keystore from repository secrets."
+            echo "$PROD_KEYSTORE" | base64 -d > pr-key.jks
+            echo "extract_key_alias=" >> $GITHUB_OUTPUT
+            echo "keystore=" >> $GITHUB_OUTPUT
+            echo "keystore_password=" >> $GITHUB_OUTPUT
+            echo "key_password=" >> $GITHUB_OUTPUT
+            echo "key_alias=" >> $GITHUB_OUTPUT
+          else
+            echo "::notice::No complete KEYSTORE secret set; generating an ephemeral key for this run."
+            KEYSTORE_PASSWORD=$(openssl rand -hex 32)
+            KEY_PASSWORD=$(openssl rand -hex 32)
+            echo "keystore_password=$KEYSTORE_PASSWORD" >> $GITHUB_OUTPUT
+            echo "key_password=$KEY_PASSWORD" >> $GITHUB_OUTPUT
+            echo "key_alias=pr-key" >> $GITHUB_OUTPUT
+            echo "extract_key_alias=pr-key" >> $GITHUB_OUTPUT
 
-          keytool -genkeypair \
-            -alias pr-key \
-            -keyalg RSA -keysize 2048 \
-            -validity 1 \
-            -storepass "$KEYSTORE_PASSWORD" \
-            -keypass "$KEY_PASSWORD" \
-            -dname "CN=KernelSU PR Build" \
-            -storetype JKS \
-            -keystore pr-key.jks
+            keytool -genkeypair \
+              -alias pr-key \
+              -keyalg RSA -keysize 2048 \
+              -validity 1 \
+              -storepass "$KEYSTORE_PASSWORD" \
+              -keypass "$KEY_PASSWORD" \
+              -dname "CN=SakiSU CI Build" \
+              -storetype JKS \
+              -keystore pr-key.jks
 
-          echo "keystore=$(base64 -w 0 pr-key.jks)" >> $GITHUB_OUTPUT
+            echo "keystore=$(base64 -w 0 pr-key.jks)" >> $GITHUB_OUTPUT
+          fi
 
       - name: Extract certificate hash and size
-        if: github.event_name == 'pull_request'
         id: extract
         env:
           STORE_PASS: ${{ steps.gen.outputs.keystore_password }}
+          PROD_STORE_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ steps.gen.outputs.extract_key_alias }}
+          PROD_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
         run: |
+          STORE_PASSWORD="$STORE_PASS"
+          if [ -z "$STORE_PASSWORD" ]; then
+            STORE_PASSWORD="$PROD_STORE_PASS"
+          fi
+          CERT_ALIAS="$KEY_ALIAS"
+          if [ -z "$CERT_ALIAS" ]; then
+            CERT_ALIAS="$PROD_KEY_ALIAS"
+          fi
+
           # Export DER certificate
           keytool -exportcert \
-            -alias pr-key \
+            -alias "$CERT_ALIAS" \
             -keystore pr-key.jks \
-            -storepass "$STORE_PASS" \
+            -storepass "$STORE_PASSWORD" \
             -file pr-cert.der
 
           # Calculate size in hex
           SIZE_DEC=$(stat -c%s pr-cert.der)
-          SIZE_HEX=$(printf '0x%04x' "$SIZE_DEC")
-          echo "expected_size=$SIZE_HEX" >> $GITHUB_OUTPUT
+          SIZE_HEX=$(printf '0x%x' "$SIZE_DEC")
 
           # Calculate SHA256 hash
           HASH=$(sha256sum pr-cert.der | awk '{print $1}')
-          echo "expected_hash=$HASH" >> $GITHUB_OUTPUT
+          OFFICIAL_SIZE=$(awk '/EXPECTED_SIZE_SAKISU/ {print $3; exit}' kernel/manager/manager_sign.h)
+          OFFICIAL_HASH=$(awk -F'"' '/EXPECTED_HASH_SAKISU/ {print $2; exit}' kernel/manager/manager_sign.h)
+          if [ "$SIZE_HEX" = "$OFFICIAL_SIZE" ] && [ "$HASH" = "$OFFICIAL_HASH" ]; then
+            echo "::notice::Build keystore matches the built-in SakiSU certificate."
+            echo "expected_size=" >> $GITHUB_OUTPUT
+            echo "expected_hash=" >> $GITHUB_OUTPUT
+          else
+            echo "expected_size=$SIZE_HEX" >> $GITHUB_OUTPUT
+            echo "expected_hash=$HASH" >> $GITHUB_OUTPUT
+          fi
 
           echo "Certificate size: $SIZE_HEX ($SIZE_DEC bytes)"
           echo "Certificate hash: $HASH"
@@ -80,11 +119,19 @@ jobs:
       expected_pr_build_hash: ${{ needs.generate-key.outputs.expected_hash || '' }}
     secrets: inherit
 
+  build-lkm-vivo:
+    needs: generate-key
+    uses: ./.github/workflows/build-lkm-vivo.yml
+    with:
+      expected_pr_build_size: ${{ needs.generate-key.outputs.expected_size || '' }}
+      expected_pr_build_hash: ${{ needs.generate-key.outputs.expected_hash || '' }}
+    secrets: inherit
+
   build-ksuinit:
     uses: ./.github/workflows/ksuinit.yml
 
   build-ksud:
-    needs: [build-lkm, build-ksuinit]
+    needs: [build-lkm, build-lkm-vivo, build-ksuinit]
     strategy:
       matrix:
         include:
@@ -127,11 +174,7 @@ jobs:
       - name: Determine commit for build
         id: commit
         run: |
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            echo "COMMIT_SHA=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
-          else
-            echo "COMMIT_SHA=${{ github.sha }}" >> $GITHUB_OUTPUT
-          fi
+          echo "COMMIT_SHA=${{ github.sha }}" >> $GITHUB_OUTPUT
 
       - name: Determine manager variant
         id: determine
@@ -148,33 +191,34 @@ jobs:
           chmod +x randomizer
           ./randomizer
 
-      - name: Write key
-        if: ${{ github.event_name == 'workflow_dispatch' || ( github.event_name != 'pull_request') || github.ref_type == 'tag' }}
-        run: |
-          if [ ! -z "${{ secrets.KEYSTORE }}" ]; then
-            {
-              echo KEYSTORE_PASSWORD='${{ secrets.KEYSTORE_PASSWORD }}'
-              echo KEY_ALIAS='${{ secrets.KEY_ALIAS }}'
-              echo KEY_PASSWORD='${{ secrets.KEY_PASSWORD }}'
-              echo KEYSTORE_FILE='key.jks'
-            } >> gradle.properties
-            echo "${{ secrets.KEYSTORE }}" | base64 -d > key.jks
-          fi
-
-      - name: Write PR key
-        if: github.event_name == 'pull_request'
+      - name: Write signing key
         env:
           PR_KEYSTORE: ${{ needs.generate-key.outputs.keystore }}
           PR_KEYSTORE_PASSWORD: ${{ needs.generate-key.outputs.keystore_password }}
+          PR_KEY_ALIAS: ${{ needs.generate-key.outputs.key_alias }}
           PR_KEY_PASSWORD: ${{ needs.generate-key.outputs.key_password }}
+          PROD_KEYSTORE: ${{ secrets.KEYSTORE }}
+          PROD_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          PROD_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          PROD_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          echo "$PR_KEYSTORE" | base64 -d > pr-key.jks
-          {
-            echo KEYSTORE_PASSWORD="$PR_KEYSTORE_PASSWORD"
-            echo KEY_ALIAS='pr-key'
-            echo KEY_PASSWORD="$PR_KEY_PASSWORD"
-            echo KEYSTORE_FILE='pr-key.jks'
-          } >> gradle.properties
+          if [ -n "$PROD_KEYSTORE" ] && [ -n "$PROD_KEYSTORE_PASSWORD" ] && [ -n "$PROD_KEY_ALIAS" ] && [ -n "$PROD_KEY_PASSWORD" ]; then
+            echo "$PROD_KEYSTORE" | base64 -d > sign-key.jks
+            {
+              echo KEYSTORE_PASSWORD="$PROD_KEYSTORE_PASSWORD"
+              echo KEY_ALIAS="$PROD_KEY_ALIAS"
+              echo KEY_PASSWORD="$PROD_KEY_PASSWORD"
+              echo KEYSTORE_FILE='sign-key.jks'
+            } >> gradle.properties
+          else
+            echo "$PR_KEYSTORE" | base64 -d > sign-key.jks
+            {
+              echo KEYSTORE_PASSWORD="$PR_KEYSTORE_PASSWORD"
+              echo KEY_ALIAS="$PR_KEY_ALIAS"
+              echo KEY_PASSWORD="$PR_KEY_PASSWORD"
+              echo KEYSTORE_FILE='sign-key.jks'
+            } >> gradle.properties
+          fi
       
       - name: Setup Java
         uses: actions/setup-java@v5
@@ -189,12 +233,15 @@ jobs:
         uses: android-actions/setup-android@v4
 
       - name: Build APK
+        env:
+          KSU_EXPECTED_PR_BUILD_SIZE: ${{ needs.generate-key.outputs.expected_size }}
+          KSU_EXPECTED_PR_BUILD_HASH: ${{ needs.generate-key.outputs.expected_hash }}
         run: |
-          if [ "${{ github.event_name }}" == "pull_request" ]; then
-            ./gradlew assemble${{ matrix.build_type }} -Pcommit=${{ steps.commit.outputs.COMMIT_SHA }} -PIS_PR_BUILD=true
-          else
-            ./gradlew assemble${{ matrix.build_type }} -Pcommit=${{ steps.commit.outputs.COMMIT_SHA }}
+          EXTRA_ARGS=""
+          if [ -n "$KSU_EXPECTED_PR_BUILD_SIZE" ] && [ -n "$KSU_EXPECTED_PR_BUILD_HASH" ]; then
+            EXTRA_ARGS="-PIS_PR_BUILD=true"
           fi
+          ./gradlew assemble${{ matrix.build_type }} -Pcommit=${{ steps.commit.outputs.COMMIT_SHA }} $EXTRA_ARGS
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -286,33 +333,32 @@ jobs:
           cp -f "$X86_64_KSUD" target/x86_64-linux-android/release/ksud
 
       - name: Prepare signing inputs
-        if: ${{ github.event_name == 'pull_request' || (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/ci' || github.ref == 'refs/heads/sync-upstream')) || github.ref_type == 'tag' }}
+        if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/ci' || github.ref == 'refs/heads/sync-upstream' || startsWith(github.ref, 'refs/heads/sync/') || github.ref_type == 'tag' }}
         env:
           PR_KEYSTORE: ${{ needs.generate-key.outputs.keystore }}
           PR_KEYSTORE_PASSWORD: ${{ needs.generate-key.outputs.keystore_password }}
+          PR_KEY_ALIAS: ${{ needs.generate-key.outputs.key_alias }}
           PR_KEY_PASSWORD: ${{ needs.generate-key.outputs.key_password }}
           PROD_KEYSTORE: ${{ secrets.KEYSTORE }}
-          PROD_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           PROD_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          PROD_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           PROD_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "$PR_KEYSTORE" | base64 -d > pr-key.jks
-            echo "SIGN_KEYSTORE_FILE=pr-key.jks" >> $GITHUB_ENV
-            echo "SIGN_KEY_ALIAS=pr-key" >> $GITHUB_ENV
-            echo "SIGN_KEYSTORE_PASSWORD=$PR_KEYSTORE_PASSWORD" >> $GITHUB_ENV
-            echo "SIGN_KEY_PASSWORD=$PR_KEY_PASSWORD" >> $GITHUB_ENV
-          else
-            test -n "$PROD_KEYSTORE"
-            echo "$PROD_KEYSTORE" | base64 -d > key.jks
-            echo "SIGN_KEYSTORE_FILE=key.jks" >> $GITHUB_ENV
+          if [ -n "$PROD_KEYSTORE" ] && [ -n "$PROD_KEYSTORE_PASSWORD" ] && [ -n "$PROD_KEY_ALIAS" ] && [ -n "$PROD_KEY_PASSWORD" ]; then
+            echo "$PROD_KEYSTORE" | base64 -d > sign-key.jks
             echo "SIGN_KEY_ALIAS=$PROD_KEY_ALIAS" >> $GITHUB_ENV
             echo "SIGN_KEYSTORE_PASSWORD=$PROD_KEYSTORE_PASSWORD" >> $GITHUB_ENV
             echo "SIGN_KEY_PASSWORD=$PROD_KEY_PASSWORD" >> $GITHUB_ENV
+          else
+            echo "$PR_KEYSTORE" | base64 -d > sign-key.jks
+            echo "SIGN_KEY_ALIAS=$PR_KEY_ALIAS" >> $GITHUB_ENV
+            echo "SIGN_KEYSTORE_PASSWORD=$PR_KEYSTORE_PASSWORD" >> $GITHUB_ENV
+            echo "SIGN_KEY_PASSWORD=$PR_KEY_PASSWORD" >> $GITHUB_ENV
           fi
+          echo "SIGN_KEYSTORE_FILE=sign-key.jks" >> $GITHUB_ENV
 
       - name: Repack and resign
-        if: ${{ github.event_name == 'pull_request' || (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/ci' || github.ref == 'refs/heads/sync-upstream')) || github.ref_type == 'tag' }}
+        if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/ci' || github.ref == 'refs/heads/sync-upstream' || startsWith(github.ref, 'refs/heads/sync/') || github.ref_type == 'tag' }}
         run: |
           python3 repack_apk_multi.py repack \
             -b ${{ matrix.build_type }} \
@@ -332,7 +378,7 @@ jobs:
           name: ${{ steps.determine.outputs.title }}-gradle-${{ matrix.build_type }}
         
       - name: Upload build artifact
-        if: ${{ github.event_name == 'pull_request' || (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/ci' || github.ref == 'refs/heads/sync-upstream')) || github.ref_type == 'tag' }}
+        if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/ci' || github.ref == 'refs/heads/sync-upstream' || startsWith(github.ref, 'refs/heads/sync/') || github.ref_type == 'tag' }}
         uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.determine.outputs.title }}-${{ matrix.build_type }}
@@ -340,7 +386,7 @@ jobs:
 
   upload-telegram:
     needs: repack-manager
-    if: github.event_name != 'pull_request' 
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     strategy:
       matrix:

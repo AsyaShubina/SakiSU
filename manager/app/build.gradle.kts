@@ -126,6 +126,11 @@ android {
         val isPrBuild = project.findProperty("IS_PR_BUILD")?.toString()?.toBoolean() ?: false
         buildConfigField("boolean", "IS_PR_BUILD", isPrBuild.toString())
 
+        val expectedPrBuildSize = System.getenv("KSU_EXPECTED_PR_BUILD_SIZE").orEmpty()
+        val expectedPrBuildHash = System.getenv("KSU_EXPECTED_PR_BUILD_HASH").orEmpty()
+        buildConfigField("String", "EXPECTED_PR_BUILD_SIZE", "\"$expectedPrBuildSize\"")
+        buildConfigField("String", "EXPECTED_PR_BUILD_HASH", "\"$expectedPrBuildHash\"")
+
         externalNativeBuild {
             cmake {
                 arguments += "-DANDROID_STL=none"

@@ -7,19 +7,23 @@ on:
       - 'manager/app/src/main/res/values/strings.xml'
       - 'manager/app/src/main/res/values-*/strings.xml'
       - '.github/workflows/crowdin.yml'
-  schedule:
-    - cron: '0 0 * * *'
-  workflow_dispatch:
 
 jobs:
   synchronize-with-crowdin:
-    environment: action
     runs-on: ubuntu-latest
+    env:
+      CROWDIN_PROJECT_ID: ${{ secrets.CROWDIN_PROJECT_ID }}
+      CROWDIN_API_TOKEN: ${{ secrets.CROWDIN_API_TOKEN }}
     steps:
     - name: Checkout
       uses: actions/checkout@v7
 
+    - name: Skip Crowdin when credentials are absent
+      if: ${{ env.CROWDIN_PROJECT_ID == '' || env.CROWDIN_API_TOKEN == '' }}
+      run: echo "Crowdin secrets are not configured; skipping translation sync."
+
     - name: Crowdin Action
+      if: ${{ env.CROWDIN_PROJECT_ID != '' && env.CROWDIN_API_TOKEN != '' }}
       uses: crowdin/github-action@v2
       with:
         upload_sources: true
@@ -37,6 +41,4 @@ jobs:
         config: 'crowdin.yml'
         crowdin_branch_name: "main"
       env:
-        GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
-        CROWDIN_PROJECT_ID: ${{ secrets.CROWDIN_PROJECT_ID }}
-        CROWDIN_API_TOKEN: ${{ secrets.CROWDIN_API_TOKEN }}
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

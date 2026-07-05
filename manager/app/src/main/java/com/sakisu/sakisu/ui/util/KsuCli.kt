@@ -153,13 +153,20 @@ fun clearDynamicManager(): Boolean {
     return result
 }
 
+private const val OFFICIAL_SAKISU_SIGNATURE =
+    "size: 0x377, hash: d3469712b6214462764a1d8d3e5cbe1d6819a0b629791b9f4101867821f1df64"
+
 suspend fun isOfficialSignature(): Boolean = withContext(Dispatchers.IO) {
     val shell = getRootShell()
     val out = shell.newJob()
         .add("${getKsuDaemonPath()} debug get-sign ${ksuApp.packageResourcePath}")
         .to(ArrayList<String>(), null).exec().out
-    out.firstOrNull()?.trim()
-        .orEmpty() == "size: 0x377, hash: d3469712b6214462764a1d8d3e5cbe1d6819a0b629791b9f4101867821f1df64"
+    val current = out.firstOrNull()?.trim().orEmpty()
+    if (current == OFFICIAL_SAKISU_SIGNATURE) return@withContext true
+
+    val prSize = BuildConfig.EXPECTED_PR_BUILD_SIZE
+    val prHash = BuildConfig.EXPECTED_PR_BUILD_HASH
+    prSize.isNotEmpty() && prHash.isNotEmpty() && current == "size: $prSize, hash: $prHash"
 }
 
 suspend fun getFeatureStatus(feature: String): String = withContext(Dispatchers.IO) {
