@@ -101,8 +101,10 @@ import com.sakisu.sakisu.ui.util.getDefaultPartition
 import com.sakisu.sakisu.ui.util.getSlotSuffix
 import com.sakisu.sakisu.ui.util.getSupportedKmis
 import com.sakisu.sakisu.ui.util.isAbDevice
-import com.sakisu.sakisu.ui.util.rootAvailable
+import com.sakisu.sakisu.ui.util.rootAvailable as isRootAvailable
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * @author ShirkNeko
@@ -568,7 +570,9 @@ private fun SelectInstallMethod(
     onSelected: (InstallMethod) -> Unit = {},
     selectedMethod: InstallMethod? = null
 ) {
-    val rootAvailable = rootAvailable()
+    val rootAvailable = produceState(initialValue = false) {
+        value = withContext(Dispatchers.IO) { isRootAvailable() }
+    }.value
     val isAbDevice = produceState(initialValue = false) {
         value = isAbDevice()
     }.value
