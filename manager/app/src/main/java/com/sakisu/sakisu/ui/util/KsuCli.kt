@@ -338,6 +338,7 @@ fun installBoot(
     lkm: LkmSelection,
     ota: Boolean,
     partition: String?,
+    vivoPatch: Boolean,
     onFinish: (Boolean, Int) -> Unit,
     onStdout: (String) -> Unit,
     onStderr: (String) -> Unit,
@@ -355,7 +356,15 @@ fun installBoot(
         }
     }
 
-    var cmd = "boot-patch"
+    val useVivoCompat = vivoPatch
+    onStdout(
+        if (useVivoCompat) {
+            "[manager] vivo compat: ksud will auto-detect vendor_boot vs init_boot"
+        } else {
+            "[manager] standard SakiSU patch flow"
+        }
+    )
+    var cmd = if (useVivoCompat) "boot-patch-vivo" else "boot-patch"
 
     cmd += if (bootFile == null) {
         // no boot.img, use -f to flash
@@ -448,6 +457,26 @@ suspend fun getSupportedKmis(): List<String> = withContext(Dispatchers.IO) {
     val cmd = "boot-info supported-kmis"
     val out = shell.newJob().add("${getKsuDaemonPath()} $cmd").to(ArrayList(), null).exec().out
     out.filter { it.isNotBlank() }.map { it.trim() }
+}
+
+suspend fun classifyBootImage(uri: Uri): String = withContext(Dispatchers.IO) {
+    val image = File(ksuApp.cacheDir, "boot-classify.img")
+    try {
+        ksuApp.contentResolver.openInputStream(uri)?.use { input ->
+            image.outputStream().use { output ->
+                input.copyTo(output)
+            }
+        } ?: return@withContext "unknown"
+
+        val shell = getRootShell()
+        val cmd = "boot-info classify-image ${image.absolutePath}"
+        ShellUtils.fastCmd(shell, "${getKsuDaemonPath()} $cmd").trim().ifBlank { "unknown" }
+    } catch (e: Throwable) {
+        Log.w(TAG, "classify boot image failed", e)
+        "unknown"
+    } finally {
+        image.delete()
+    }
 }
 
 suspend fun isAbDevice(): Boolean = withContext(Dispatchers.IO) {

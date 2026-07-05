@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -32,6 +33,7 @@ import androidx.compose.material.icons.automirrored.filled.Input
 import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FileUpload
+import androidx.compose.material.icons.filled.Security
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -58,6 +60,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -91,6 +94,7 @@ import com.sakisu.sakisu.ui.theme.getCardColors
 import com.sakisu.sakisu.ui.theme.getCardElevation
 import com.sakisu.sakisu.ui.theme.renderBackgroundBlur
 import com.sakisu.sakisu.ui.util.LkmSelection
+import com.sakisu.sakisu.ui.util.classifyBootImage
 import com.sakisu.sakisu.ui.util.getAvailablePartitions
 import com.sakisu.sakisu.ui.util.getCurrentKmi
 import com.sakisu.sakisu.ui.util.getDefaultPartition
@@ -98,6 +102,7 @@ import com.sakisu.sakisu.ui.util.getSlotSuffix
 import com.sakisu.sakisu.ui.util.getSupportedKmis
 import com.sakisu.sakisu.ui.util.isAbDevice
 import com.sakisu.sakisu.ui.util.rootAvailable
+import kotlinx.coroutines.launch
 
 /**
  * @author ShirkNeko
@@ -115,6 +120,16 @@ fun InstallScreen(
     var showRebootDialog by remember { mutableStateOf(false) }
     var showSlotSelectionDialog by remember { mutableStateOf(false) }
     var tempKernelUri by remember { mutableStateOf<Uri?>(null) }
+    var selectedBootImageKind by remember { mutableStateOf<String?>(null) }
+    val coroutineScope = rememberCoroutineScope()
+    var enableVivoPatch by remember {
+        mutableStateOf(
+            Build.MANUFACTURER.orEmpty().contains("vivo", ignoreCase = true) ||
+                Build.MANUFACTURER.orEmpty().contains("iqoo", ignoreCase = true) ||
+                Build.BRAND.orEmpty().contains("vivo", ignoreCase = true) ||
+                Build.BRAND.orEmpty().contains("iqoo", ignoreCase = true)
+        )
+    }
 
     val kernelVersion = getKernelVersion()
     val isGKI = kernelVersion.isGKI()
@@ -164,8 +179,13 @@ fun InstallScreen(
     }
 
     var partitionSelectionIndex by remember { mutableIntStateOf(0) }
-    var partitionsState by remember { mutableStateOf<List<String>>(emptyList()) }
     var hasCustomSelected by remember { mutableStateOf(false) }
+    val partitionsState = produceState(initialValue = emptyList<String>()) {
+        value = getAvailablePartitions()
+    }.value
+    val defaultPartitionState = produceState(initialValue = "") {
+        value = getDefaultPartition()
+    }.value
     val navigator = LocalNavigator.current
 
     val onInstall = {
@@ -188,7 +208,8 @@ fun InstallScreen(
                         boot = if (method is InstallMethod.SelectFile) method.uri else null,
                         lkm = lkmSelection,
                         ota = isOta,
-                        partition = partitionSelection
+                        partition = partitionSelection,
+                        vivoPatch = enableVivoPatch,
                     )
                     navigator.push(Route.Flash(flashIt))
                 }
@@ -216,18 +237,49 @@ fun InstallScreen(
         value = getCurrentKmi()
     }
 
-    val selectKmiDialog = rememberSelectKmiDialog { kmi ->
+    val preferredKmi = if (enableVivoPatch) {
+        currentKmi.takeIf { it.isNotBlank() }?.let { base ->
+            if (base.endsWith("_vivo")) base else "${base}_vivo"
+        }
+    } else {
+        currentKmi.takeIf { it.isNotBlank() }
+    }
+
+    val selectKmiDialog = rememberSelectKmiDialog(preferredKmi = preferredKmi) { kmi ->
         kmi?.let {
             lkmSelection = LkmSelection.KmiString(it)
             onInstall()
         }
     }
 
-    val onClickNext = {
-        if (isGKI && lkmSelection == LkmSelection.KmiNone && currentKmi.isBlank() && installMethod !is InstallMethod.HorizonKernel) {
+    val continueInstall: () -> Unit = {
+        val selectedPartition = partitionsState.getOrNull(partitionSelectionIndex)
+        val isVivoVendorBootRmvr = enableVivoPatch &&
+            (selectedBootImageKind == "vendor_boot" || selectedPartition == "vendor_boot")
+        val needsKmi = isGKI &&
+            lkmSelection == LkmSelection.KmiNone &&
+            installMethod !is InstallMethod.HorizonKernel &&
+            (if (enableVivoPatch) !isVivoVendorBootRmvr else currentKmi.isBlank())
+
+        if (needsKmi) {
             selectKmiDialog.show()
         } else {
             onInstall()
+        }
+    }
+
+    val onClickNext: () -> Unit = {
+        val method = installMethod
+        if (enableVivoPatch &&
+            method is InstallMethod.SelectFile &&
+            selectedBootImageKind == null
+        ) {
+            coroutineScope.launch {
+                selectedBootImageKind = method.uri?.let { classifyBootImage(it) } ?: "unknown"
+                continueInstall()
+            }
+        } else {
+            continueInstall()
         }
     }
 
@@ -287,6 +339,7 @@ fun InstallScreen(
             SelectInstallMethod(
                 isGKI = isGKI,
                 onSelected = { method ->
+                    selectedBootImageKind = null
                     if (method is InstallMethod.HorizonKernel && method.uri != null) {
                         if (isAbDevice) {
                             tempKernelUri = method.uri
@@ -325,20 +378,11 @@ fun InstallScreen(
                             value = getSlotSuffix(isOta)
                         }.value
 
-                        val partitions = produceState(initialValue = emptyList()) {
-                            value = getAvailablePartitions()
-                        }.value
-
-                        val defaultPartition = produceState(initialValue = "") {
-                            value = getDefaultPartition()
-                        }.value
-
-                        partitionsState = partitions
-                        val displayPartitions = partitions.map { name ->
-                            if (defaultPartition == name) "$name (default)" else name
+                        val displayPartitions = partitionsState.map { name ->
+                            if (defaultPartitionState == name) "$name (default)" else name
                         }
 
-                        val defaultIndex = partitions.indexOf(defaultPartition).takeIf { it >= 0 } ?: 0
+                        val defaultIndex = partitionsState.indexOf(defaultPartitionState).takeIf { it >= 0 } ?: 0
                         if (!hasCustomSelected) partitionSelectionIndex = defaultIndex
 
                         if (displayPartitions.isNotEmpty()) {
@@ -353,6 +397,37 @@ fun InstallScreen(
                                 },
                             )
                         }
+                    }
+                }
+            }
+
+            if (isGKI) {
+                ElevatedCard(
+                    colors = getCardColors(MaterialTheme.colorScheme.surfaceVariant),
+                    elevation = getCardElevation(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 8.dp)
+                        .renderBackgroundBlur(MaterialTheme.colorScheme.surfaceVariant),
+                ) {
+                    SettingsBaseWidget(
+                        title = "vivo修补",
+                        description = "去除vr或适配vivo特性",
+                        icon = Icons.Default.Security,
+                        onClick = {
+                            enableVivoPatch = !enableVivoPatch
+                            selectedBootImageKind = null
+                        },
+                    ) {
+                        Text(
+                            text = if (enableVivoPatch) "ON" else "OFF",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = if (enableVivoPatch) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            }
+                        )
                     }
                 }
             }
@@ -810,11 +885,35 @@ private fun SelectInstallMethod(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun rememberSelectKmiDialog(onSelected: (String?) -> Unit): DialogHandle {
+fun rememberSelectKmiDialog(
+    preferredKmi: String? = null,
+    onSelected: (String?) -> Unit
+): DialogHandle {
     return rememberCustomDialog { dismiss ->
         val supportedKmi by produceState(initialValue = emptyList()) {
             value = getSupportedKmis()
         }
+        val orderedKmis = remember(supportedKmi, preferredKmi) {
+            if (preferredKmi.isNullOrBlank()) {
+                supportedKmi
+            } else {
+                val preferred = supportedKmi.firstOrNull { it == preferredKmi }
+                val fallback = if (preferredKmi.endsWith("_vivo")) {
+                    preferredKmi.removeSuffix("_vivo")
+                } else {
+                    preferredKmi
+                }
+                val secondary = supportedKmi.firstOrNull { it == fallback }
+                buildList {
+                    preferred?.let { add(it) }
+                    if (secondary != null && secondary != preferred) add(secondary)
+                    addAll(supportedKmi.filter { it != preferred && it != secondary })
+                }
+            }
+        }
+        val selectedIndex = preferredKmi
+            ?.let { orderedKmis.indexOf(it).takeIf { index -> index >= 0 } }
+            ?: if (orderedKmis.isNotEmpty()) 0 else -1
 
         MaterialTheme(
             colorScheme = MaterialTheme.colorScheme.copy(
@@ -824,11 +923,11 @@ fun rememberSelectKmiDialog(onSelected: (String?) -> Unit): DialogHandle {
             SettingsChooseDialog(
                 show = true,
                 title = stringResource(R.string.select_kmi),
-                items = supportedKmi,
-                selectedIndex = -1,
+                items = orderedKmis,
+                selectedIndex = selectedIndex,
                 onDismiss = dismiss,
                 onSelectedIndexChange = { index ->
-                    onSelected(supportedKmi.getOrNull(index))
+                    onSelected(orderedKmis.getOrNull(index))
                 }
             )
         }
